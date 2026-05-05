@@ -52,7 +52,7 @@ def _parse_valor(s: str) -> float:
         s = s.replace('.', '').replace(',', '.')
     else:
         s = s.replace(',', '.')
-    return float(s)
+    return round(float(s), 2)
 
 
 def parse(texto: str, categorias_custom: list = None) -> dict | None:

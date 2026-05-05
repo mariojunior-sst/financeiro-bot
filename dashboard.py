@@ -64,14 +64,12 @@ def carregar_dados():
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     client = gspread.authorize(creds)
     ws = client.open_by_key(os.environ['SHEET_ID']).worksheet('Lançamentos')
-    registros = ws.get_all_records()
+    registros = ws.get_all_records(value_render_option='UNFORMATTED_VALUE')
     if not registros:
         return pd.DataFrame()
 
     df = pd.DataFrame(registros)
-    df['Valor'] = pd.to_numeric(
-        df['Valor'].astype(str).str.replace(',', '.'), errors='coerce'
-    ).fillna(0)
+    df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce').fillna(0)
     df['Data'] = pd.to_datetime(df['Data'], format='%d/%m/%Y', errors='coerce')
 
     # Compatibilidade com formato antigo (sem coluna Empresa)
@@ -147,7 +145,9 @@ with col_pizza:
     st.subheader("🗂 Gastos por Categoria")
     df_custo = df_f[df_f['Tipo'] == 'CUSTO']
     if not df_custo.empty and 'Categoria' in df_custo.columns:
+        df_custo = df_custo[df_custo['Categoria'].astype(str).str.strip().isin(['', '0']) == False]
         df_cat = df_custo.groupby('Categoria')['Valor'].sum().reset_index()
+        df_cat = df_cat[df_cat['Valor'] > 0]
         fig = px.pie(
             df_cat, values='Valor', names='Categoria', hole=0.45,
             color_discrete_sequence=['#F5A623', '#E74C3C', '#3498DB',

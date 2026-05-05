@@ -69,9 +69,9 @@ def registrar(tipo: str, valor: float, empresa: str, categoria: str, descricao: 
         tipo.upper(),
         empresa.upper(),
         categoria.title(),
-        valor,
+        round(valor, 2),
         descricao,
-    ])
+    ], value_input_option='RAW')
 
 
 def resumo_mes(ano: int = None, mes: int = None) -> dict:
