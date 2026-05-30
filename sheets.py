@@ -4,6 +4,7 @@ from datetime import datetime
 
 import gspread
 from google.oauth2.service_account import Credentials
+from lancamentos import _normalizar
 
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -118,11 +119,14 @@ def listar_categorias_custom() -> list[str]:
     try:
         ws = _aba_categorias()
         registros = ws.get_all_records()
-        return [r['Nome'].lower() for r in registros if r.get('Nome')]
+        return [_normalizar(r['Nome']) for r in registros if r.get('Nome')]
     except Exception:
         return []
 
 
 def salvar_categoria_custom(nome: str) -> None:
     ws = _aba_categorias()
-    ws.append_row([nome.lower()])
+    nome_norm = _normalizar(nome)
+    existentes = [_normalizar(r['Nome']) for r in ws.get_all_records() if r.get('Nome')]
+    if nome_norm not in existentes:
+        ws.append_row([nome.lower()])

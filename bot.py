@@ -232,7 +232,7 @@ async def handle_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    todas_cats = lancamentos.CATEGORIAS_GASTO_FIXAS + cats_custom + ['receita']
+    todas_cats = [lancamentos._normalizar(c) for c in lancamentos.CATEGORIAS_GASTO_FIXAS] + cats_custom + ['receita']
     cat = lancamento['categoria_gasto']
 
     # Categoria desconhecida — perguntar se quer criar
