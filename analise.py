@@ -410,12 +410,13 @@ def problemas_de_dados(df: pd.DataFrame) -> list:
     if sem_desc:
         avisos.append(f"{sem_desc} lançamento(s) sem descrição.")
 
-    receita_em_custo = df[(df['Tipo'] == 'CUSTO') &
-                          (df['Categoria'].isin(['Receita', 'Salário']))]
+    # 'Salário' como CUSTO é a folha de pagamento do funcionário, não erro.
+    # Só 'Receita' lançada como custo é contradição de verdade.
+    receita_em_custo = df[(df['Tipo'] == 'CUSTO') & (df['Categoria'] == 'Receita')]
     if len(receita_em_custo):
         avisos.append(
             f"{len(receita_em_custo)} lançamento(s) marcados como CUSTO mas "
-            "categorizados como Receita/Salário — provável erro de digitação."
+            "categorizados como Receita — provável erro de digitação."
         )
 
     dup = int(df.duplicated(subset=['Data', 'Tipo', 'Empresa', 'Valor', 'Descrição'],
