@@ -1,0 +1,16 @@
+# Sem isto os widgets do Streamlit (selects, tabelas, botões) saem no tema
+# claro padrão e brigam com o dashboard escuro.
+[theme]
+base = "dark"
+primaryColor = "#3987e5"
+backgroundColor = "#0A1728"
+secondaryBackgroundColor = "#12263F"
+textColor = "#E8EEF5"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = false
+
+[browser]
+gatherUsageStats = false

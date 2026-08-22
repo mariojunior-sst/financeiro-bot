@@ -75,44 +75,23 @@ def registrar(tipo: str, valor: float, empresa: str, categoria: str, descricao: 
     ], value_input_option='RAW')
 
 
-def resumo_mes(ano: int = None, mes: int = None) -> dict:
-    agora = datetime.now()
-    ano = ano or agora.year
-    mes = mes or agora.month
-    prefixo_mes = f"{mes:02d}/{ano}"
-
-    ws = _aba_lancamentos()
-    registros = ws.get_all_records()
-
-    resultado = {
-        'extinprag': {'receita': 0.0, 'custo': 0.0},
-        'vsafety':   {'receita': 0.0, 'custo': 0.0},
-        'pessoal':   {'receita': 0.0, 'custo': 0.0},
-    }
-
-    for r in registros:
-        data = r.get('Data', '')
-        if len(data) < 10 or data[3:10] != prefixo_mes:
-            continue
-
-        # Suporte ao formato antigo ('Categoria' era empresa) e novo ('Empresa')
-        empresa = r.get('Empresa', r.get('Categoria', '')).lower()
-        tipo = r.get('Tipo', '').lower()
-        try:
-            valor = float(str(r.get('Valor', 0)).replace(',', '.'))
-        except ValueError:
-            continue
-
-        if empresa in resultado and tipo in ('receita', 'custo'):
-            resultado[empresa][tipo] += valor
-
-    return resultado
-
-
 def ultimos_lancamentos(n: int = 10) -> list[dict]:
     ws = _aba_lancamentos()
     registros = ws.get_all_records()
     return registros[-n:] if len(registros) >= n else registros
+
+
+def carregar_df():
+    """DataFrame normalizado de toda a planilha — base das análises do bot.
+
+    É a mesma função que o dashboard usa, então /resumo e painel sempre
+    mostram o mesmo número.
+    """
+    import analise
+
+    ws = _aba_lancamentos()
+    registros = ws.get_all_records(value_render_option='UNFORMATTED_VALUE')
+    return analise.preparar(registros)
 
 
 def listar_categorias_custom() -> list[str]:
