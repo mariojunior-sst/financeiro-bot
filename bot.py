@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, time as hora_do_dia
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -15,6 +15,7 @@ from telegram.ext import (
 import analise
 import lancamentos
 import sheets
+import vencimentos
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -85,6 +86,18 @@ moradia • cartão • alimentação • supermercado
 educação • telefone • saúde • investimento • transporte
 
 Use vírgula ou ponto para decimais: `1.200,50` ou `1200.50`
+
+*Contas fixas (lembrete automático):*
+`/novaconta nome | dia | empresa`
+Ex.: `/novaconta Financiamento da casa | 10 | pessoal`
+
+Sem valor: ele varia mês a mês. A baixa é automática — ao lançar
+`custo 2350 pessoal financiamento da casa`, a conta é quitada sozinha.
+
+/contas — todas as contas e o que falta pagar
+/lembrete — o que está vencendo agora
+/pausarconta — pausar ou retomar uma conta
+/paguei — baixa manual, só para conta paga fora do bot
 
 *Comandos:*
 /resumo — fechamento do mês com comparativo
@@ -468,14 +481,20 @@ async def callback_confirmacao(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         context.user_data.pop('pendente', None)
+
+        # O lançamento é que dá baixa na conta fixa — não existe passo manual.
+        extra, teclado = await _baixa_automatica(l)
+
         emoji = "💰" if l['tipo'] == 'receita' else "💸"
         await query.edit_message_text(
             f"{emoji} *Registrado com sucesso!*\n\n"
             f"🏢 Empresa: {l['empresa'].upper()}\n"
             f"🗂 Categoria: {l['categoria_gasto'].title()}\n"
             f"💵 Valor: {lancamentos.formatar_brl(l['valor'])}\n"
-            f"📝 Descrição: {l['descricao'] or '—'}",
+            f"📝 Descrição: {l['descricao'] or '—'}"
+            f"{extra}",
             parse_mode='Markdown',
+            reply_markup=teclado,
         )
 
     elif acao == "corrigir":
@@ -524,6 +543,401 @@ async def callback_confirmacao(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text("Nenhum lançamento pendente.")
 
 
+# ---------------------------------------------------------------------------
+# Contas fixas — cadastro, baixa e o lembrete que chega sozinho de manhã
+# ---------------------------------------------------------------------------
+
+HORA_LEMBRETE = os.environ.get('HORA_LEMBRETE', '07:00')
+
+MSG_NOVA_CONTA = (
+    "Formato do cadastro:\n"
+    "`/novaconta nome | dia | empresa`\n\n"
+    "*Exemplos:*\n"
+    "`/novaconta Financiamento da casa | 10 | pessoal`\n"
+    "`/novaconta Energia | 25 | extinprag`\n"
+    "`/novaconta Internet | 5 | pessoal | telefone`\n\n"
+    "_O valor não entra no cadastro: ele varia mês a mês e vem do custo que "
+    "você lançar._\n"
+    "_A categoria (4º campo) é opcional — sem ela o bot deduz pelo nome._"
+)
+
+
+async def _carregar_contas(update) -> "list | None":
+    try:
+        return sheets.listar_contas()
+    except Exception as e:
+        logger.error(f"Erro ao carregar contas fixas: {e}")
+        await update.message.reply_text(
+            "❌ Não consegui ler a aba *Contas Fixas* da planilha. Tente de novo.",
+            parse_mode='Markdown',
+        )
+        return None
+
+
+def _teclado_contas(contas: list, acao: str, valor: float = None,
+                    com_nenhuma: bool = False) -> InlineKeyboardMarkup:
+    """Um botão por conta. Evita numeração digitada, que muda de ordem todo dia."""
+    botoes = []
+    for c in contas:
+        rotulo = (
+            f"{vencimentos.EMOJI[c['status']]} {_curto(c['nome'], 26)} · "
+            f"venc. {c['vencimento'].strftime('%d/%m')}"
+        )
+        dado = f"conta:{acao}:{c['linha']}:{c['competencia_alvo']}"
+        if valor is not None:
+            dado += f":{valor:.2f}"
+        botoes.append([InlineKeyboardButton(rotulo, callback_data=dado)])
+    if com_nenhuma:
+        botoes.append([InlineKeyboardButton(
+            "❌ Nenhuma delas", callback_data="conta:nenhuma:0:-",
+        )])
+    return InlineKeyboardMarkup(botoes)
+
+
+async def cmd_contas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _autorizado(update):
+        return
+    contas = await _carregar_contas(update)
+    if contas is None:
+        return
+    await update.message.reply_text(
+        vencimentos.montar_painel(contas), parse_mode='Markdown',
+    )
+
+
+async def cmd_nova_conta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _autorizado(update):
+        return
+
+    bruto = update.message.text.partition(' ')[2]
+    campos = [p.strip() for p in bruto.split('|')]
+
+    if len(campos) < 3 or not campos[0]:
+        await update.message.reply_text(MSG_NOVA_CONTA, parse_mode='Markdown')
+        return
+
+    nome, dia_txt, empresa = campos[0], campos[1], campos[2].lower()
+    categoria = campos[3].lower() if len(campos) > 3 and campos[3] else None
+
+    try:
+        dia = int(dia_txt)
+    except ValueError:
+        dia = 0
+    if not 1 <= dia <= 31:
+        await update.message.reply_text(
+            "❌ O dia do vencimento precisa ser um número de 1 a 31.\n\n"
+            "_Dia 29, 30 ou 31 cai no último dia do mês quando ele for mais curto._",
+            parse_mode='Markdown',
+        )
+        return
+
+    if empresa not in lancamentos.CATEGORIAS:
+        disponiveis = ' · '.join(f"`{c}`" for c in lancamentos.CATEGORIAS)
+        await update.message.reply_text(
+            f"❌ Empresa *{empresa}* não existe. Use: {disponiveis}",
+            parse_mode='Markdown',
+        )
+        return
+
+    deduzida = False
+    if not categoria:
+        categoria = lancamentos.detectar_categoria_gasto(nome)
+        deduzida = categoria == 'outros'
+
+    try:
+        sheets.salvar_conta(nome, dia, empresa, categoria)
+    except Exception as e:
+        logger.error(f"Erro ao salvar conta fixa: {e}")
+        await update.message.reply_text("❌ Erro ao salvar na planilha. Tente novamente.")
+        return
+
+    ref = vencimentos.hoje()
+    prox = vencimentos.vencimento_do_mes(ref.year, ref.month, dia)
+
+    # Cadastro feito depois do vencimento do mês: o bot não tem como saber se
+    # essa parcela já foi paga, então avisa em vez de assumir.
+    ressalva = ''
+    if prox <= ref:
+        ressalva = (
+            f"\n\n⚠️ O vencimento de {prox.strftime('%d/%m')} já passou, então ela "
+            f"entra como *em aberto*. Se você já pagou, use /paguei para dar baixa."
+        )
+
+    # O nome não bateu com nenhuma palavra-chave conhecida: melhor avisar do que
+    # deixar a conta caindo em "Outros" e sujando o gráfico de categorias.
+    if deduzida:
+        ressalva += (
+            "\n\n💡 Não consegui deduzir a categoria pelo nome, então ficou em "
+            "*Outros*. Para escolher, informe no 4º campo:\n"
+            f"`/novaconta {nome} | {dia} | {empresa} | moradia`"
+        )
+
+    await update.message.reply_text(
+        f"✅ *Conta fixa cadastrada!*\n\n"
+        f"📌 {nome}\n"
+        f"📆 Todo dia {dia} · 🏢 {empresa.upper()} · 🗂 {categoria.title()}\n\n"
+        f"Próxima cobrança na sua lista: {prox.strftime('%d/%m/%Y')}.\n"
+        f"Vou te avisar {vencimentos.ANTECEDENCIA_AVISO} dias antes, às {HORA_LEMBRETE}.\n\n"
+        f"Para dar baixa, é só lançar o custo como sempre:\n"
+        f"`custo 2350 {empresa} {nome.lower()}`"
+        f"{ressalva}",
+        parse_mode='Markdown',
+    )
+
+
+def _texto_restantes(conta: dict) -> str:
+    """Avisa quando ainda sobra mês em aberto na mesma conta.
+
+    Quem esqueceu dois meses paga um de cada vez: dizer que ainda falta é o
+    que impede o atraso antigo de sumir junto com o pagamento de hoje.
+    """
+    restantes = conta.get('ciclos_abertos', 1) - 1
+    if restantes <= 0:
+        return ''
+    plural = 'meses' if restantes > 1 else 'mês'
+    return f"\n🔴 Essa conta ainda tem *{restantes} {plural}* em aberto."
+
+
+def _texto_baixa(conta: dict) -> str:
+    comp = vencimentos.rotulo_competencia(conta['competencia_alvo'])
+    return (
+        f"\n\n✅ *Baixa automática:* {conta['nome']} — {comp} quitado."
+        f"{_texto_restantes(conta)}"
+    )
+
+
+async def _baixa_automatica(l: dict) -> tuple:
+    """Quita a conta fixa correspondente ao custo recém-lançado.
+
+    Devolve (texto extra, teclado) para anexar à confirmação do lançamento.
+    Falha aqui nunca derruba o lançamento: o custo já está gravado, e a baixa
+    é um bônus — no pior caso a conta continua aparecendo no aviso.
+    """
+    if l['tipo'] != 'custo':
+        return '', None
+
+    try:
+        contas = sheets.listar_contas()
+    except Exception as e:
+        logger.error(f"Baixa automática: falha ao ler as contas fixas: {e}")
+        return '', None
+
+    candidatas = vencimentos.candidatas_para_baixa(contas, l['descricao'], l['empresa'])
+    if not candidatas:
+        return '', None
+
+    if len(candidatas) > 1:
+        # Empate no casamento: baixar a conta errada é pior do que perguntar.
+        return (
+            "\n\n❓ *Esse custo quita qual conta fixa?*",
+            _teclado_contas(candidatas, 'quita', valor=l['valor'], com_nenhuma=True),
+        )
+
+    conta = candidatas[0]
+    try:
+        sheets.marcar_conta_paga(conta['linha'], conta['competencia_alvo'], l['valor'])
+    except Exception as e:
+        logger.error(f"Baixa automática: falha ao gravar a baixa: {e}")
+        return '', None
+
+    return _texto_baixa(conta), None
+
+
+async def cmd_paguei(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _autorizado(update):
+        return
+    contas = await _carregar_contas(update)
+    if contas is None:
+        return
+
+    abertas = [
+        c for c in vencimentos.analisar_todas(contas)
+        if c['status'] not in (vencimentos.PAGO, vencimentos.PAUSADO)
+    ]
+    if not abertas:
+        await update.message.reply_text(
+            "✅ *Tudo quitado neste mês.* Nada em aberto.", parse_mode='Markdown',
+        )
+        return
+
+    await update.message.reply_text(
+        "Baixa manual — para conta paga *fora* do bot (débito automático, por "
+        "exemplo). Lançando o custo normalmente, a baixa é automática.\n\n"
+        "Qual conta você pagou?",
+        parse_mode='Markdown',
+        reply_markup=_teclado_contas(abertas, 'pagar'),
+    )
+
+
+async def cmd_pausar_conta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _autorizado(update):
+        return
+    contas = await _carregar_contas(update)
+    if contas is None:
+        return
+    if not contas:
+        await update.message.reply_text(MSG_NOVA_CONTA, parse_mode='Markdown')
+        return
+
+    await update.message.reply_text(
+        "Toque para pausar (ou retomar) uma conta:",
+        reply_markup=_teclado_contas(vencimentos.analisar_todas(contas), 'pausar'),
+    )
+
+
+async def cmd_lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mesmo texto do aviso automático, sob demanda — serve de teste também."""
+    if not _autorizado(update):
+        return
+    contas = await _carregar_contas(update)
+    if contas is None:
+        return
+
+    texto = vencimentos.montar_lembrete(contas)
+    if not texto:
+        await update.message.reply_text(
+            f"🟢 *Nada a pagar nos próximos {vencimentos.ANTECEDENCIA_AVISO} dias.*\n\n"
+            "Use /contas para ver o mês inteiro.",
+            parse_mode='Markdown',
+        )
+        return
+    await update.message.reply_text(texto, parse_mode='Markdown')
+
+
+async def callback_contas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    partes = query.data.split(':')
+    acao = partes[1]
+
+    if acao == 'nenhuma':
+        # Só tira os botões: a confirmação do lançamento acima continua valendo.
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    try:
+        contas = sheets.listar_contas()
+    except Exception as e:
+        logger.error(f"Erro ao carregar contas no callback: {e}")
+        await query.edit_message_text("❌ Erro ao ler a planilha. Tente novamente.")
+        return
+
+    linha = int(partes[2])
+    conta = next((c for c in contas if c['linha'] == linha), None)
+    if conta is None:
+        await query.edit_message_text("❌ Conta não encontrada. Use /contas para atualizar.")
+        return
+
+    if acao in ('pagar', 'quita'):
+        competencia = partes[3]
+        # 'quita' vem de um custo já lançado e carrega o valor; 'pagar' é a
+        # baixa manual, sem valor conhecido.
+        valor = float(partes[4]) if len(partes) > 4 else None
+
+        try:
+            sheets.marcar_conta_paga(linha, competencia, valor)
+        except Exception as e:
+            logger.error(f"Erro ao dar baixa: {e}")
+            await query.edit_message_text("❌ Erro ao salvar a baixa. Tente novamente.")
+            return
+
+        # A conta lida da planilha ainda não tem os campos de análise.
+        analisada = vencimentos.analisar(conta)
+        analisada['competencia_alvo'] = competencia
+
+        rotulo = vencimentos.rotulo_competencia(competencia)
+        if valor is None:
+            corpo = (
+                f"✅ *Baixa manual:* {conta['nome']} — {rotulo} quitado.\n\n"
+                "_Como foi paga fora do bot, o custo não entrou no financeiro._"
+            )
+        else:
+            corpo = (
+                f"💸 *Custo lançado e conta quitada.*\n\n"
+                f"📌 {conta['nome']} — {rotulo}\n"
+                f"💵 {lancamentos.formatar_brl(valor)}"
+            )
+
+        await query.edit_message_text(
+            corpo + _texto_restantes(analisada), parse_mode='Markdown',
+        )
+
+    elif acao == 'pausar':
+        novo_estado = not conta['ativa']
+        try:
+            sheets.alternar_conta_ativa(linha, novo_estado)
+        except Exception as e:
+            logger.error(f"Erro ao pausar conta: {e}")
+            await query.edit_message_text("❌ Erro ao atualizar a planilha. Tente novamente.")
+            return
+
+        if novo_estado:
+            await query.edit_message_text(
+                f"▶️ *{conta['nome']}* reativada — volto a te lembrar dela.",
+                parse_mode='Markdown',
+            )
+        else:
+            await query.edit_message_text(
+                f"⏸ *{conta['nome']}* pausada — não entra mais nos avisos.\n\n"
+                "_O histórico continua na planilha; use /pausarconta para retomar._",
+                parse_mode='Markdown',
+            )
+
+
+async def job_lembrete(context: ContextTypes.DEFAULT_TYPE):
+    """Roda todo dia no horário configurado e só fala quando há o que cobrar."""
+    if not ALLOWED_USER_ID:
+        logger.warning("ALLOWED_USER_ID não definido — lembrete automático desligado.")
+        return
+
+    try:
+        contas = sheets.listar_contas()
+    except Exception as e:
+        logger.error(f"Lembrete: falha ao ler a planilha: {e}")
+        return
+
+    ref = vencimentos.hoje()
+
+    # No dia 1º ele recebe o mapa do mês inteiro, antes de qualquer cobrança.
+    if ref.day == 1:
+        agenda = vencimentos.montar_agenda_do_mes(contas, ref)
+        if agenda:
+            await context.bot.send_message(
+                chat_id=ALLOWED_USER_ID, text=agenda, parse_mode='Markdown',
+            )
+
+    texto = vencimentos.montar_lembrete(contas, ref)
+    if not texto:
+        logger.info("Lembrete: nada em aberto hoje, nenhum aviso enviado.")
+        return
+
+    await context.bot.send_message(
+        chat_id=ALLOWED_USER_ID, text=texto, parse_mode='Markdown',
+    )
+
+
+def _agendar_lembrete(app) -> None:
+    if app.job_queue is None:
+        logger.error(
+            "JobQueue indisponível — instale python-telegram-bot[job-queue]. "
+            "Os comandos de contas funcionam, mas o aviso automático não."
+        )
+        return
+
+    try:
+        horas, _, minutos = HORA_LEMBRETE.partition(':')
+        alvo = hora_do_dia(
+            hour=int(horas), minute=int(minutos or 0), tzinfo=vencimentos.FUSO,
+        )
+    except ValueError:
+        logger.error(f"HORA_LEMBRETE inválida ({HORA_LEMBRETE}); usando 07:00.")
+        alvo = hora_do_dia(hour=7, minute=0, tzinfo=vencimentos.FUSO)
+
+    app.job_queue.run_daily(job_lembrete, time=alvo, name='lembrete_contas')
+    logger.info(f"Lembrete de contas agendado para {alvo} ({vencimentos.FUSO}).")
+
+
 def main():
     token = os.environ['TELEGRAM_TOKEN']
     app = Application.builder().token(token).build()
@@ -536,8 +950,19 @@ def main():
     app.add_handler(CommandHandler('categorias', cmd_categorias))
     app.add_handler(CommandHandler('comparar', cmd_comparar))
     app.add_handler(CommandHandler('empresas', cmd_empresas))
+    app.add_handler(CommandHandler('contas', cmd_contas))
+    app.add_handler(CommandHandler('novaconta', cmd_nova_conta))
+    app.add_handler(CommandHandler('paguei', cmd_paguei))
+    app.add_handler(CommandHandler('pausarconta', cmd_pausar_conta))
+    app.add_handler(CommandHandler('lembrete', cmd_lembrete))
+
+    # O handler de contas vem antes do genérico: o de lançamentos não tem
+    # pattern e engoliria os callbacks `conta:*` se viesse primeiro.
+    app.add_handler(CallbackQueryHandler(callback_contas, pattern=r'^conta:'))
     app.add_handler(CallbackQueryHandler(callback_confirmacao))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_mensagem))
+
+    _agendar_lembrete(app)
 
     logger.info("Bot iniciado.")
     app.run_polling()

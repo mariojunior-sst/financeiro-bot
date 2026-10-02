@@ -144,3 +144,103 @@ custo 150 pessoal supermercado
 **Quero ver o relatório em mais detalhes:**
 - Acesse a planilha diretamente — todos os lançamentos ficam na aba **Lançamentos**
 - Você pode criar filtros, gráficos e tabelas dinâmicas diretamente no Sheets
+
+
+---
+
+## Contas fixas e lembrete de pagamento
+
+O bot avisa sozinho, no Telegram, sobre as contas fixas mensais — para não
+repetir o esquecimento que gera juros.
+
+### Duas ideias que definem o módulo
+
+**1. Conta fixa é fixa no compromisso, não no valor.** Energia, financiamento e
+telefone mudam todo mês, então o valor **não é cadastrado**. O que se cadastra é
+o que vence e em que dia.
+
+**2. Não existe comando de "paguei".** Quando você lança o custo — do jeito que
+já lançava — o bot reconhece a conta pela descrição e **dá a baixa sozinho**,
+gravando o valor real daquele mês. Um passo manual a mais seria mais uma coisa
+para esquecer, que é exatamente o problema que o módulo resolve.
+
+### Como funciona
+
+1. Cadastra a conta uma vez:
+   `/novaconta Financiamento da casa | 10 | pessoal`
+   (nome | dia do vencimento | empresa | categoria opcional)
+2. Todo dia às **07:00 (horário de Belém)** o bot verifica o que está em aberto.
+3. Ele **só escreve quando há algo a cobrar** — atrasada, vencendo hoje, ou
+   vencendo nos próximos 5 dias. Silêncio significa que está tudo em dia.
+4. No **dia 1º** ele manda a agenda do mês inteiro, antes de qualquer cobrança.
+5. Você paga e lança o custo como sempre:
+   `custo 2410,55 pessoal financiamento da casa`
+   → o custo entra no financeiro **e** a conta é quitada, numa tacada só.
+
+### Como o bot reconhece a conta no custo lançado
+
+Compara as palavras do nome cadastrado com as da descrição do lançamento,
+ignorando conectivos (`de`, `da`, `conta`, `boleto`…). Aceita quando o nome
+inteiro aparece, ou quando aparece metade dele **com pelo menos uma palavra
+distintiva** (5+ letras).
+
+Na prática: `financiamento` quita "Financiamento da casa"; `casa de carnes`
+não. O custo também precisa ser da **mesma empresa** da conta.
+
+Se duas contas empatarem (`energia` com "Energia casa" e "Energia escritório"
+cadastradas), ele **pergunta em vez de chutar** — dar baixa na conta errada é
+pior do que perguntar.
+
+### Comandos
+
+| Comando | O que faz |
+|---|---|
+| `/novaconta nome \| dia \| empresa` | Cadastra uma conta fixa |
+| `/contas` | Todas as contas, urgente primeiro |
+| `/lembrete` | Mostra agora o mesmo texto do aviso automático |
+| `/pausarconta` | Pausa ou retoma uma conta (contrato encerrado, etc.) |
+| `/paguei` | Baixa manual — **só** para conta paga fora do bot |
+
+`/paguei` existe para o caso de débito automático ou pagamento feito no banco
+sem lançar o custo. Ele não lança nada no financeiro, só tira a conta do radar.
+
+### Aba `Contas Fixas` (criada sozinha na primeira execução)
+
+| Coluna | Conteúdo |
+|---|---|
+| Nome | Identificação da conta — é por ela que o casamento acontece |
+| Dia | Dia do vencimento (1 a 31) |
+| Empresa | EXTINPRAG, VSAFETY ou PESSOAL |
+| Categoria | Categoria de gasto |
+| Ativa | SIM / NÃO (o `/pausarconta` mexe aqui) |
+| Pago Até | Última competência quitada, no formato `AAAA-MM` |
+| Último Valor | Preenchido pelo bot na baixa — referência, não previsão |
+| Observação | Livre |
+
+**`Pago Até` é o coração do controle.** Se ele marca `2026-07` e já estamos em
+setembro, o bot entende que **agosto ficou em aberto** e cobra o mês esquecido —
+mesmo com o mês já virado. Cada baixa quita **um** mês, começando sempre pelo
+mais antigo, e o bot avisa quantos ainda restam. Assim pagar setembro não
+apaga o atraso de agosto por tabela.
+
+Dia 29, 30 ou 31 cai automaticamente no último dia dos meses mais curtos.
+
+**Cuidado ao editar `Pago Até` na mão:** digitando `2026-08`, o Sheets converte
+para data. A leitura aguenta (converte de volta), mas o formato texto é o
+esperado.
+
+### Variáveis de ambiente (opcionais, no serviço `worker`)
+
+| Variável | Padrão | Para quê |
+|---|---|---|
+| `HORA_LEMBRETE` | `07:00` | Horário do aviso diário |
+| `ANTECEDENCIA_AVISO` | `5` | Dias de antecedência do aviso |
+| `FUSO_HORARIO` | `America/Belem` | Fuso do agendamento |
+
+O aviso é enviado para o `ALLOWED_USER_ID` — a mesma variável que já autoriza o
+uso do bot, então não há nada novo a configurar para receber os lembretes.
+
+**Atenção na dependência:** o lembrete depende de
+`python-telegram-bot[job-queue]` (o extra instala o APScheduler). Sem o extra o
+bot sobe e os comandos funcionam, mas o aviso automático não roda — e o log
+avisa isso na inicialização.
