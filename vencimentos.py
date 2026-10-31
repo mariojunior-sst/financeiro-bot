@@ -95,6 +95,11 @@ def _mes_seguinte(ano: int, mes: int) -> tuple:
     return (ano + 1, 1) if mes == 12 else (ano, mes + 1)
 
 
+def competencia_anterior(comp: str) -> str:
+    ano, mes = int(comp[:4]), int(comp[5:7])
+    return f"{ano - 1:04d}-12" if mes == 1 else f"{ano:04d}-{mes - 1:02d}"
+
+
 def ciclos_em_aberto(conta: dict, ref: date) -> list:
     """Vencimentos já chegados (<= hoje) que ainda não foram quitados.
 
@@ -250,6 +255,28 @@ def candidatas_para_baixa(contas: list, descricao: str, empresa: str = None,
 
     melhor = max(nota for nota, _ in pontuadas)
     return [conta for nota, conta in pontuadas if nota == melhor]
+
+
+def contas_baixadas_por(contas: list, descricao: str, empresa: str,
+                        valor: float) -> tuple:
+    """Contas cuja baixa pode ter vindo de um custo que será apagado.
+
+    Devolve (com o mesmo valor, só com o nome parecido). A planilha não guarda
+    qual lançamento quitou cada conta: o 'Último Valor' igual é a prova que
+    existe. Sem ela, a conta não é reaberta por conta própria.
+    """
+    mesmo_valor, so_nome = [], []
+    for conta in contas:
+        if conta['empresa'] != empresa.lower() or not conta.get('pago_ate'):
+            continue
+        if pontuar_casamento(conta['nome'], descricao) <= 0:
+            continue
+        ultimo = conta.get('ultimo_valor')
+        if ultimo is not None and abs(ultimo - valor) < 0.005:
+            mesmo_valor.append(conta)
+        else:
+            so_nome.append(conta)
+    return mesmo_valor, so_nome
 
 
 # ---------------------------------------------------------------------------

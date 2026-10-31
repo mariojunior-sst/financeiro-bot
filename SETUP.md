@@ -129,6 +129,11 @@ custo 150 pessoal supermercado
 /historico
 ```
 
+**Apagar um lançamento feito errado:**
+```
+/apagar
+```
+
 ---
 
 ## Dúvidas frequentes

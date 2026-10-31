@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from datetime import datetime, timedelta
@@ -79,6 +80,58 @@ def ultimos_lancamentos(n: int = 10) -> list[dict]:
     ws = _aba_lancamentos()
     registros = ws.get_all_records()
     return registros[-n:] if len(registros) >= n else registros
+
+
+def _lancamento_da_linha(numero: int, linha: list) -> dict:
+    """Monta o lançamento e a assinatura que prova que a linha ainda é a mesma."""
+    celulas = (list(linha) + [''] * len(CABECALHO))[:len(CABECALHO)]
+    data, hora, tipo, empresa, categoria, valor, descricao = celulas
+    assinatura = hashlib.sha1(
+        '|'.join(str(c) for c in celulas).encode('utf-8')
+    ).hexdigest()[:10]
+    return {
+        'linha': numero,
+        'data': str(data),
+        'hora': str(hora),
+        'tipo': str(tipo).strip().upper(),
+        'empresa': str(empresa).strip().upper(),
+        'categoria': str(categoria),
+        'valor': _num(valor),
+        'descricao': str(descricao),
+        'assinatura': assinatura,
+    }
+
+
+def lancamentos_recentes(n: int = 10) -> list[dict]:
+    """Últimos lançamentos, do mais novo para o mais antigo, com a linha real.
+
+    Lê as linhas cruas em vez de `get_all_records` para o número da linha
+    continuar certo mesmo se houver linha em branco no meio da planilha.
+    """
+    ws = _aba_lancamentos()
+    linhas = ws.get_values(value_render_option='UNFORMATTED_VALUE')
+    recentes = []
+    for numero in range(len(linhas), 1, -1):
+        linha = linhas[numero - 1]
+        if not any(str(c).strip() for c in linha):
+            continue
+        recentes.append(_lancamento_da_linha(numero, linha))
+        if len(recentes) == n:
+            break
+    return recentes
+
+
+def buscar_lancamento(numero: int) -> dict | None:
+    linha = _aba_lancamentos().row_values(
+        numero, value_render_option='UNFORMATTED_VALUE',
+    )
+    if not any(str(c).strip() for c in linha):
+        return None
+    return _lancamento_da_linha(numero, linha)
+
+
+def apagar_lancamento(numero: int) -> None:
+    _aba_lancamentos().delete_rows(numero)
 
 
 def carregar_df():
@@ -218,6 +271,12 @@ def marcar_conta_paga(linha: int, competencia: str, valor: float = None) -> None
         # Uma chamada só para as duas colunas — metade das idas à API.
         ws.update([[competencia, round(float(valor), 2)]], f'F{linha}:G{linha}',
                   value_input_option='RAW')
+
+
+def reabrir_conta(linha: int, competencia: str) -> None:
+    """Desfaz a baixa: volta 'Pago Até' e limpa o valor do lançamento apagado."""
+    ws = _aba_contas()
+    ws.update([[competencia, '']], f'F{linha}:G{linha}', value_input_option='RAW')
 
 
 def alternar_conta_ativa(linha: int, ativa: bool) -> None:

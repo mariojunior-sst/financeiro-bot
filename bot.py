@@ -3,6 +3,7 @@ import os
 from datetime import datetime, time as hora_do_dia
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.helpers import escape_markdown
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -105,6 +106,7 @@ Sem valor: ele varia mês a mês. A baixa é automática — ao lançar
 /comparar — mês atual x mês anterior, categoria a categoria
 /empresas — resultado e margem de cada frente
 /historico — últimos 10 lançamentos
+/apagar — apagar um lançamento feito errado
 /dashboard — link do dashboard financeiro
 /ajuda — ver esta mensagem
 """.strip()
@@ -416,6 +418,156 @@ async def cmd_historico(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     await update.message.reply_text('\n'.join(linhas), parse_mode='Markdown')
+
+
+def _md(texto) -> str:
+    """Descrição com `_` ou `*` não pode quebrar a mensagem em Markdown."""
+    return escape_markdown(str(texto), version=1)
+
+
+def _baixa_a_desfazer(l: dict) -> tuple:
+    """Devolve (conta a reabrir, aviso) para o custo prestes a ser apagado.
+
+    Sem desfazer a baixa, relançar o valor certo quitaria o mês seguinte.
+    """
+    if l['tipo'] != 'CUSTO':
+        return None, ''
+
+    mesmo_valor, so_nome = vencimentos.contas_baixadas_por(
+        sheets.listar_contas(), l['descricao'], l['empresa'], l['valor'],
+    )
+    if len(mesmo_valor) == 1:
+        return mesmo_valor[0], ''
+
+    # Empate ou valor diferente: reabrir a conta errada é pior do que avisar.
+    suspeitas = mesmo_valor or so_nome
+    if not suspeitas:
+        return None, ''
+    nomes = ', '.join(_md(c['nome']) for c in suspeitas)
+    return None, f"\n\n⚠️ Não vou mexer em: {nomes}. Confira em /contas se a baixa continua certa."
+
+
+async def cmd_apagar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _autorizado(update):
+        return
+
+    try:
+        recentes = sheets.lancamentos_recentes(10)
+    except Exception as e:
+        logger.error(f"Erro ao listar lançamentos para apagar: {e}")
+        await update.message.reply_text("❌ Erro ao acessar a planilha. Tente novamente.")
+        return
+
+    if not recentes:
+        await update.message.reply_text("Nenhum lançamento encontrado.")
+        return
+
+    botoes = []
+    for l in recentes:
+        emoji = "💰" if l['tipo'] == 'RECEITA' else "💸"
+        rotulo = (
+            f"{emoji} {lancamentos.formatar_brl(l['valor'])} · {l['data'][:5]} · "
+            f"{_curto(l['descricao'] or l['categoria'] or l['empresa'], 18)}"
+        )
+        botoes.append([InlineKeyboardButton(
+            rotulo, callback_data=f"apagar:ver:{l['linha']}:{l['assinatura']}",
+        )])
+    botoes.append([InlineKeyboardButton("❌ Cancelar", callback_data="apagar:nao")])
+
+    await update.message.reply_text(
+        "🗑 Qual lançamento você quer apagar?\n\nOs mais recentes vêm primeiro.",
+        reply_markup=InlineKeyboardMarkup(botoes),
+    )
+
+
+async def callback_apagar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not _autorizado(update):
+        return
+
+    partes = query.data.split(':')
+    acao = partes[1]
+
+    if acao == 'nao':
+        await query.edit_message_text("Nada foi apagado.")
+        return
+
+    linha, assinatura = int(partes[2]), partes[3]
+
+    try:
+        l = sheets.buscar_lancamento(linha)
+        # Apagar muda a numeração das linhas: um botão antigo poderia apontar
+        # para outro lançamento, e isso aqui remove dado de verdade.
+        if l is None or l['assinatura'] != assinatura:
+            await query.edit_message_text(
+                "⚠️ A planilha mudou e esse lançamento não está mais nessa posição. "
+                "Nada foi apagado. Use /apagar de novo."
+            )
+            return
+        conta, aviso = _baixa_a_desfazer(l)
+    except Exception as e:
+        logger.error(f"Erro ao preparar a exclusão: {e}")
+        await query.edit_message_text("❌ Erro ao acessar a planilha. Nada foi apagado.")
+        return
+
+    resumo = (
+        f"🏢 Empresa: {_md(l['empresa'])}\n"
+        f"🗂 Categoria: {_md(l['categoria'])}\n"
+        f"💵 Valor: {lancamentos.formatar_brl(l['valor'])}\n"
+        f"📅 Data: {_md(l['data'])} {_md(l['hora'])}\n"
+        f"📝 Descrição: {_md(l['descricao'] or '—')}"
+    )
+
+    if acao == 'ver':
+        reabre = ''
+        if conta:
+            comp = vencimentos.rotulo_competencia(conta['pago_ate'])
+            reabre = (
+                f"\n\n🔄 A conta fixa *{_md(conta['nome'])}* será reaberta: "
+                f"{comp} volta a ficar em aberto."
+            )
+        await query.edit_message_text(
+            f"🗑 *Apagar este lançamento?*\n\n{resumo}{reabre}{aviso}\n\n"
+            "_Essa ação não pode ser desfeita pelo bot._",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🗑 Sim, apagar", callback_data=f"apagar:sim:{linha}:{assinatura}",
+                ),
+                InlineKeyboardButton("❌ Não", callback_data="apagar:nao"),
+            ]]),
+        )
+        return
+
+    try:
+        sheets.apagar_lancamento(linha)
+    except Exception as e:
+        logger.error(f"Erro ao apagar lançamento: {e}")
+        await query.edit_message_text("❌ Erro ao apagar na planilha. Tente novamente.")
+        return
+
+    extra = aviso
+    if conta:
+        comp = conta['pago_ate']
+        try:
+            sheets.reabrir_conta(conta['linha'], vencimentos.competencia_anterior(comp))
+            extra = (
+                f"\n\n🔄 Conta fixa *{_md(conta['nome'])}* reaberta: "
+                f"{vencimentos.rotulo_competencia(comp)} voltou a ficar em aberto."
+            )
+        except Exception as e:
+            logger.error(f"Erro ao reabrir conta fixa: {e}")
+            extra = (
+                f"\n\n⚠️ Não consegui reabrir a conta *{_md(conta['nome'])}*. "
+                "Corrija a coluna 'Pago Até' antes de relançar."
+            )
+
+    await query.edit_message_text(
+        f"✅ *Lançamento apagado.*\n\n{resumo}{extra}\n\n"
+        "Se precisar, lance de novo com o valor certo.",
+        parse_mode='Markdown',
+    )
 
 
 async def handle_mensagem(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -946,6 +1098,7 @@ def main():
     app.add_handler(CommandHandler('ajuda', cmd_ajuda))
     app.add_handler(CommandHandler('resumo', cmd_resumo))
     app.add_handler(CommandHandler('historico', cmd_historico))
+    app.add_handler(CommandHandler('apagar', cmd_apagar))
     app.add_handler(CommandHandler('dashboard', cmd_dashboard))
     app.add_handler(CommandHandler('categorias', cmd_categorias))
     app.add_handler(CommandHandler('comparar', cmd_comparar))
@@ -956,9 +1109,10 @@ def main():
     app.add_handler(CommandHandler('pausarconta', cmd_pausar_conta))
     app.add_handler(CommandHandler('lembrete', cmd_lembrete))
 
-    # O handler de contas vem antes do genérico: o de lançamentos não tem
-    # pattern e engoliria os callbacks `conta:*` se viesse primeiro.
+    # Os handlers com pattern vêm antes do genérico: o de lançamentos não tem
+    # pattern e engoliria os callbacks `conta:*` e `apagar:*` se viesse primeiro.
     app.add_handler(CallbackQueryHandler(callback_contas, pattern=r'^conta:'))
+    app.add_handler(CallbackQueryHandler(callback_apagar, pattern=r'^apagar:'))
     app.add_handler(CallbackQueryHandler(callback_confirmacao))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_mensagem))
 
